@@ -15,10 +15,12 @@
 package livestate
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
@@ -657,6 +659,87 @@ func Test_calculateSyncStatus(t *testing.T) {
 			t.Parallel()
 			got := calculateSyncStatus(tt.args.states)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+type capturingLoader struct {
+	input provider.LoaderInput
+}
+
+func (c *capturingLoader) LoadManifests(_ context.Context, input provider.LoaderInput) ([]provider.Manifest, error) {
+	c.input = input
+	return nil, nil
+}
+
+func TestLoadManifests_KustomizeOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		input       kubeconfig.KubernetesDeploymentInput
+		multiTarget *kubeconfig.KubernetesMultiTarget
+		wantVersion string
+		wantOptions map[string]string
+	}{
+		{
+			name:        "uses top-level values when multiTarget is nil",
+			input:       kubeconfig.KubernetesDeploymentInput{KustomizeVersion: "5.3.0", KustomizeOptions: map[string]string{"flag": "value"}},
+			wantVersion: "5.3.0",
+			wantOptions: map[string]string{"flag": "value"},
+		},
+		{
+			name:        "multiTarget version overrides top-level",
+			input:       kubeconfig.KubernetesDeploymentInput{KustomizeVersion: "5.3.0", KustomizeOptions: map[string]string{"flag": "value"}},
+			multiTarget: &kubeconfig.KubernetesMultiTarget{KustomizeVersion: "5.4.3"},
+			wantVersion: "5.4.3",
+			wantOptions: map[string]string{"flag": "value"},
+		},
+		{
+			name:        "multiTarget options override top-level",
+			input:       kubeconfig.KubernetesDeploymentInput{KustomizeVersion: "5.3.0", KustomizeOptions: map[string]string{"original": "value"}},
+			multiTarget: &kubeconfig.KubernetesMultiTarget{KustomizeOptions: map[string]string{"enable-helm": ""}},
+			wantVersion: "5.3.0",
+			wantOptions: map[string]string{"enable-helm": ""},
+		},
+		{
+			name: "multiTarget overrides both version and options",
+			input: kubeconfig.KubernetesDeploymentInput{
+				KustomizeVersion: "5.3.0",
+				KustomizeOptions: map[string]string{"original": "value"},
+			},
+			multiTarget: &kubeconfig.KubernetesMultiTarget{
+				KustomizeVersion: "5.4.3",
+				KustomizeOptions: map[string]string{"enable-helm": ""},
+			},
+			wantVersion: "5.4.3",
+			wantOptions: map[string]string{"enable-helm": ""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cl := &capturingLoader{}
+			input := &sdk.GetLivestateInput[kubeconfig.KubernetesApplicationSpec]{
+				Request: sdk.GetLivestateRequest[kubeconfig.KubernetesApplicationSpec]{
+					PipedID:         "piped-id",
+					ApplicationID:   "app-id",
+					ApplicationName: "app-name",
+					DeploymentSource: sdk.DeploymentSource[kubeconfig.KubernetesApplicationSpec]{
+						ApplicationDirectory:      "testdata",
+						ApplicationConfigFilename: "app.pipecd.yaml",
+					},
+				},
+			}
+			spec := &kubeconfig.KubernetesApplicationSpec{Input: tt.input}
+
+			_, err := Plugin{}.loadManifests(context.Background(), input, spec, cl, zaptest.NewLogger(t), tt.multiTarget)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantVersion, cl.input.KustomizeVersion)
+			assert.Equal(t, tt.wantOptions, cl.input.KustomizeOptions)
 		})
 	}
 }
